@@ -1,6 +1,67 @@
 import type { OutboundRetryConfig } from "../../../config/types.base.js";
 import { retryAsync } from "../../../infra/retry.js";
+import { isRateLimitErrorMessage } from "../../pi-embedded-helpers/errors.js";
 import { log } from "../logger.js";
+
+/**
+ * Extract HTTP status code from error object.
+ * Supports various error formats from different LLM providers.
+ */
+function extractStatusCode(err: unknown): number | undefined {
+  if (typeof err !== "object" || err === null) {
+    return undefined;
+  }
+
+  const errObj = err as Record<string, unknown>;
+
+  // Direct status property
+  if (typeof errObj.status === "number") {
+    return errObj.status;
+  }
+  if (typeof errObj.status === "string") {
+    const parsed = Number(errObj.status);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+
+  // Nested in error object
+  if (errObj.error && typeof errObj.error === "object") {
+    const nested = errObj.error as Record<string, unknown>;
+    if (typeof nested.status === "number") {
+      return nested.status;
+    }
+    if (typeof nested.status === "string") {
+      const parsed = Number(nested.status);
+      if (!Number.isNaN(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  // HTTP style code in message (e.g., "HTTP 429")
+  const msg = extractErrorMessage(err);
+  const match = msg.match(/HTTP[^\d]*(\d{3})/i);
+  if (match) {
+    return Number(match[1]);
+  }
+
+  return undefined;
+}
+
+/**
+ * Check if HTTP status code indicates a retryable error.
+ * These codes represent temporary failures that may resolve on retry.
+ */
+function isRetryableStatusCode(code: number): boolean {
+  // 429: Rate limit exceeded
+  // 500: Internal server error
+  // 502: Bad gateway (temporary overload)
+  // 503: Service unavailable (temporary overload)
+  // 504: Gateway timeout (temporary)
+  const retryableCodes = [429, 500, 502, 503, 504];
+  return retryableCodes.includes(code);
+}
 
 /**
  * Extract error message from various error formats across different LLM providers.
@@ -54,64 +115,77 @@ function extractErrorMessage(err: unknown): string {
 }
 
 /**
- * Check if error is a rate limit / TPM limit error.
- * Supports all major LLM providers:
- * - Anthropic: rate_limit_error,_overloaded_error
- * - OpenAI: rate_limit_error,insufficient_quota
- * - Google: 429 Too Many Requests
- * - AWS Bedrock: ThrottlingException
- * - Generic: TPM, quota, 429
+ * Check if error is retryable (rate limit, overload, or temporary failure).
+ * Supports all major LLM providers and handles both SDK errors and formatted
+ * user-facing messages (e.g., from pi-ai SDK after retries exhausted).
  */
 function isRetryableError(err: unknown): boolean {
+  // Check HTTP status code first (most reliable for retries)
+  const statusCode = extractStatusCode(err);
+  if (statusCode !== undefined && isRetryableStatusCode(statusCode)) {
+    return true;
+  }
+
   const msg = extractErrorMessage(err).toLowerCase();
 
-  // Rate limit type patterns (explicit error types from various SDKs)
-  const retryableTypes = [
+  // Reuse the core rate limit pattern detection from errors.ts
+  if (isRateLimitErrorMessage(msg)) {
+    return true;
+  }
+
+  // SDK-specific error types not covered by isRateLimitErrorMessage
+  // These are explicit error types from various LLM SDKs
+  const sdkErrorTypes = [
     "rate_limit_error",
     "rate_limit_exceeded",
-    "rate_limit",
     "overloaded_error",
-    "overloaded",
     "throttling_exception",
-    "throttled",
-    "insufficient_quota",
     "resource_exhausted",
     "resource_has_been_exhausted",
-    "usage_limit",
     "tokens_per_minute",
   ];
 
-  // Check if message contains any retryable type
-  for (const type of retryableTypes) {
+  for (const type of sdkErrorTypes) {
     if (msg.includes(type)) {
       return true;
     }
   }
 
-  // Check for Chinese patterns (toLowerCase doesn't affect Chinese)
-  if (
-    msg.includes("请求额度超限") ||
-    msg.includes("请求频率超限") ||
-    msg.includes("限流") ||
-    msg.includes("速率限制")
-  ) {
+  // Chinese error patterns for LLM providers
+  const chineseErrorPatterns = ["请求额度超限", "请求频率超限", "限流", "速率限制"];
+
+  for (const pattern of chineseErrorPatterns) {
+    if (msg.includes(pattern)) {
+      return true;
+    }
+  }
+
+  // Check for formatted error messages (from pi-ai SDK or user-facing errors)
+  // These are often what remains after SDK retries have been exhausted
+  const formattedErrorPatterns = [
+    /api[_\s]?rate[_\s]?limit/i,
+    /api rate limit reached/i,
+    /too[_\s]?many[_\s]?requests?/i,
+    /tpm[_\s]?limit/i,
+    /tokens per minute/i,
+    /rate[_\s]?limit[_\s]?(?:exceeded|error)?/i,
+    /overloaded/i,
+    /service[_\s]?(?:unavailable|temporarily[_\s]?overloaded)/i,
+    /请/i, // Chinese "please" (part of "请稍后重试" type messages)
+    /重试/i, // Chinese "retry"
+  ];
+
+  if (formattedErrorPatterns.some((pattern) => pattern.test(msg))) {
     return true;
   }
 
-  // Check for common rate limit patterns in text
-  const rateLimitPatterns = [
-    /tpm\s*limit/i,
-    /rate\s*limit/i,
-    /too\s*many\s*requests?/i,
-    /quota\s*(?:exceeded|reached)/i,
-    /usage\s*limit/i,
-    /\b429\b/,
-    /\b502\b.*\bBad\s*Gateway\b/i, // Sometimes indicates temporary overload
+  // HTTP 502/503 errors often indicate temporary service overload
+  const httpErrorPatterns = [
+    /\b502\b.*\bBad\s*Gateway\b/i,
     /\b503\b.*\bService\s*(?:Unavailable|Temporarily\s*Overloaded)/i,
-    /resource\s*(?:has\s*been\s*)?exhausted/i,
   ];
 
-  return rateLimitPatterns.some((pattern) => pattern.test(msg));
+  return httpErrorPatterns.some((pattern) => pattern.test(msg));
 }
 
 /**
