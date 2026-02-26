@@ -55,6 +55,16 @@ export const ModelDefinitionSchema = z
   })
   .strict();
 
+export const RetryConfigSchema = z
+  .object({
+    attempts: z.number().int().min(1).optional(),
+    minDelayMs: z.number().int().min(0).optional(),
+    maxDelayMs: z.number().int().min(0).optional(),
+    jitter: z.number().min(0).max(1).optional(),
+  })
+  .strict()
+  .optional();
+
 export const ModelProviderSchema = z
   .object({
     baseUrl: z.string().min(1),
@@ -65,6 +75,7 @@ export const ModelProviderSchema = z
     api: ModelApiSchema.optional(),
     headers: z.record(z.string(), z.string()).optional(),
     authHeader: z.boolean().optional(),
+    retry: RetryConfigSchema.optional(),
     models: z.array(ModelDefinitionSchema),
   })
   .strict();
@@ -343,16 +354,6 @@ export const requireOpenAllowFrom = (params: {
 };
 
 export const MSTeamsReplyStyleSchema = z.enum(["thread", "top-level"]);
-
-export const RetryConfigSchema = z
-  .object({
-    attempts: z.number().int().min(1).optional(),
-    minDelayMs: z.number().int().min(0).optional(),
-    maxDelayMs: z.number().int().min(0).optional(),
-    jitter: z.number().min(0).max(1).optional(),
-  })
-  .strict()
-  .optional();
 
 export const QueueModeBySurfaceSchema = z
   .object({
