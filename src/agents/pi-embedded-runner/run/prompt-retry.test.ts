@@ -406,8 +406,6 @@ describe("prompt-retry", () => {
 
         expect(result).toBe("success");
         expect(attempts).toBe(2);
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        void _label; // preserve label in test data for future debugging
       }
     });
 

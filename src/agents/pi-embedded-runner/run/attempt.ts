@@ -1126,8 +1126,6 @@ export async function runEmbeddedAttempt(
             await abortable(
               runWithPromptRetry(
                 () => activeSession.prompt(effectivePrompt, { images: imageResult.images }),
-                params.provider,
-                params.modelId,
                 retryConfig,
                 runAbortController.signal,
               ),
@@ -1136,8 +1134,6 @@ export async function runEmbeddedAttempt(
             await abortable(
               runWithPromptRetry(
                 () => activeSession.prompt(effectivePrompt),
-                params.provider,
-                params.modelId,
                 retryConfig,
                 runAbortController.signal,
               ),
