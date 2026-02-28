@@ -1127,6 +1127,7 @@ export async function runEmbeddedAttempt(
                 () => activeSession.prompt(effectivePrompt, { images: imageResult.images }),
                 retryConfig,
                 runAbortController.signal,
+                activeSession,
               ),
             );
           } else {
@@ -1135,6 +1136,7 @@ export async function runEmbeddedAttempt(
                 () => activeSession.prompt(effectivePrompt),
                 retryConfig,
                 runAbortController.signal,
+                activeSession,
               ),
             );
           }

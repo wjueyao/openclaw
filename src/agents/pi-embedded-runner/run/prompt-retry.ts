@@ -1,95 +1,18 @@
 import type { OutboundRetryConfig } from "../../../config/types.base.js";
 import { sleepWithAbort } from "../../../infra/backoff.js";
-import { isRateLimitErrorMessage } from "../../pi-embedded-helpers/errors.js";
 import { log } from "../logger.js";
 
+// Rate limit detection regex - matches TPM/rate limit errors specifically
+// SDK's _isRetryableError covers more cases (500, 502, connection errors) but
+// we only want to retry rate limits externally as a TPM fallback.
+const RATE_LIMIT_RE =
+  /rate.?limit|too many requests|throttl|429|tpm|tokens.?per.?minute|quota.?exceeded|resource.?exhausted|overloaded/i;
+
 /**
- * Simplified rate limit recovery wrapper with exponential backoff.
- *
- * Works with pi-ai SDK error formats:
- * - Object: { status: 429, message: "Rate limit exceeded" }
- * - Error: new Error("429: Too Many Requests")
- * - String: "TPM limit reached"
- *
- * Adds an external retry layer on top of the SDK's internal retry mechanism.
- *
- * Retry history is tracked internally and logged on final failure for diagnostics.
+ * Check if an error message indicates a rate limit / TPM error.
  */
-function isRetryableStatusCode(code: number): boolean {
-  // 429: Rate limit exceeded
-  // 500: Internal server error
-  // 502: Bad gateway (temporary overload)
-  // 503: Service unavailable (temporary overload)
-  // 504: Gateway timeout (temporary)
-  const retryableCodes = [429, 500, 502, 503, 504];
-  return retryableCodes.includes(code);
-}
-
-function extractStatusCode(err: unknown): number | undefined {
-  if (typeof err !== "object" || err === null) {
-    return undefined;
-  }
-
-  const errObj = err as Record<string, unknown>;
-
-  // Direct status property (e.g., { status: 429, ... })
-  if (typeof errObj.status === "number") {
-    return errObj.status;
-  }
-
-  // Nested in error object
-  if (errObj.error && typeof errObj.error === "object") {
-    const nested = errObj.error as Record<string, unknown>;
-    if (typeof nested.status === "number") {
-      return nested.status;
-    }
-  }
-
-  return undefined;
-}
-
-function isRateLimitError(err: unknown): boolean {
-  if (!err) {
-    return false;
-  }
-
-  // Check HTTP status code first (most reliable indicator for retry decisions)
-  const statusCode = extractStatusCode(err);
-  if (statusCode !== undefined && isRetryableStatusCode(statusCode)) {
-    return true;
-  }
-
-  // Check string errors directly (isRateLimitErrorMessage handles case normalization)
-  if (typeof err === "string") {
-    return isRateLimitErrorMessage(err);
-  }
-
-  // Check Error instances - pass message directly since isRateLimitErrorMessage normalizes case
-  if (err instanceof Error && err.message) {
-    return isRateLimitErrorMessage(err.message);
-  }
-
-  // Handle object errors with various shapes
-  if (typeof err === "object") {
-    const errObj = err as Record<string, unknown>;
-
-    // Check nested error structure: { error: { message: "...", status: ... } }
-    if (errObj.error && typeof errObj.error === "object") {
-      const nested = errObj.error as Record<string, unknown>;
-      const nestedMsg = nested.message ?? nested.error;
-      if (typeof nestedMsg === "string" && isRateLimitErrorMessage(nestedMsg)) {
-        return true;
-      }
-    }
-
-    // Check direct message/error properties
-    const directMsg = errObj.message ?? errObj.error;
-    if (typeof directMsg === "string" && isRateLimitErrorMessage(directMsg)) {
-      return true;
-    }
-  }
-
-  return false;
+function isRateLimitErrorMessage(msg: string): boolean {
+  return RATE_LIMIT_RE.test(msg);
 }
 
 function applyJitter(delayMs: number, jitter: number): number {
@@ -140,10 +63,26 @@ interface RetryAttempt {
   errorMessage: string;
 }
 
+/**
+ * Minimal interface for SDK session object we need to access.
+ * We only access messages and agent properties for rate limit detection.
+ */
+interface SdkSessionLike {
+  messages?: Array<{ role?: string; stopReason?: string; errorMessage?: string }>;
+  agent?: {
+    replaceMessages: (messages: unknown[]) => void;
+  };
+}
+
+function isSdkSessionLike(value: unknown): value is SdkSessionLike {
+  return typeof value === "object" && value !== null && ("messages" in value || "agent" in value);
+}
+
 export async function runWithPromptRetry<T>(
   fn: () => Promise<T>,
   retryConfig?: OutboundRetryConfig,
   signal?: AbortSignal,
+  session?: unknown,
 ): Promise<T> {
   const config = retryConfig ?? DEFAULT_RECOVERY_CONFIG;
   const attempts = config.attempts ?? 5;
@@ -151,13 +90,62 @@ export async function runWithPromptRetry<T>(
   let lastError: unknown;
   let lastErrorMessage = "";
 
+  // Track removed error messages for potential restoration on final failure
+  // This ensures non-invasive behavior: if all retries fail, the original
+  // error message is restored so users see the same result as without retry.
+  type AssistantMessage = { role?: string; stopReason?: string; errorMessage?: string };
+  const removedErrorMessages: AssistantMessage[] = [];
+
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await fn();
+      const result = await fn();
+
+      // Check for SDK-internal errors that were converted to assistant messages
+      // (SDK catches LLM errors and creates error assistant messages instead of throwing)
+      if (isSdkSessionLike(session)) {
+        const messages = session.messages;
+
+        // Find last assistant message
+        let lastAssistant: AssistantMessage | undefined;
+        if (messages && Array.isArray(messages)) {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i]?.role === "assistant") {
+              lastAssistant = messages[i];
+              break;
+            }
+          }
+        }
+
+        // Check if it's an error message that indicates rate limit
+        if (
+          lastAssistant &&
+          lastAssistant.stopReason === "error" &&
+          lastAssistant.errorMessage &&
+          isRateLimitErrorMessage(lastAssistant.errorMessage)
+        ) {
+          const errorMsg = lastAssistant.errorMessage;
+          log.warn(`[rate-limit] SDK error detected: ${errorMsg.slice(0, 200)}`);
+
+          // Save the error message for potential restoration
+          removedErrorMessages.push(lastAssistant);
+
+          // Remove the error assistant message using replaceMessages (immutable pattern)
+          const agent = session.agent;
+          if (agent && typeof agent.replaceMessages === "function" && messages) {
+            const filtered = messages.filter((m) => m !== lastAssistant);
+            agent.replaceMessages(filtered);
+          }
+
+          // Throw to trigger retry
+          throw new Error(`Rate limit error: ${errorMsg}`);
+        }
+      }
+
+      return result;
     } catch (err) {
       lastError = err;
 
-      // Extract error message for history
+      // Extract error message
       if (err instanceof Error) {
         lastErrorMessage = err.message;
       } else if (typeof err === "string") {
@@ -170,21 +158,43 @@ export async function runWithPromptRetry<T>(
       }
 
       // Check if it's a rate limit error
-      if (!isRateLimitError(err)) {
-        // Non-rate-limit error, don't retry
+      // We only retry rate limit / TPM errors, not all errors
+      if (!isRateLimitErrorMessage(lastErrorMessage)) {
+        log.debug(
+          `[rate-limit] Non-rate-limit error, not retrying: ${lastErrorMessage.slice(0, 100)}`,
+        );
+        // Restore removed error messages before throwing
+        if (isSdkSessionLike(session) && removedErrorMessages.length > 0) {
+          const agent = session.agent;
+          const messages = session.messages;
+          if (agent && typeof agent.replaceMessages === "function" && messages) {
+            agent.replaceMessages([...messages, ...removedErrorMessages]);
+          }
+        }
         throw err;
       }
 
       // Rate limit error - wait and retry
       if (attempt >= attempts) {
-        // Last attempt, give up - log full history for diagnostics
-        log.info(`[rate-limit] exhausted ${attempts} attempts, last error: ${lastErrorMessage}`);
+        log.warn(`[rate-limit] Exhausted ${attempts} attempts, last error: ${lastErrorMessage}`);
+
+        // Restore removed error messages to maintain non-invasive behavior
+        // Users will see the same error message as without retry logic
+        if (isSdkSessionLike(session) && removedErrorMessages.length > 0) {
+          const agent = session.agent;
+          const messages = session.messages;
+          if (agent && typeof agent.replaceMessages === "function" && messages) {
+            const restored = [...messages, ...removedErrorMessages];
+            agent.replaceMessages(restored);
+            log.debug(`[rate-limit] Restored ${removedErrorMessages.length} error message(s)`);
+          }
+        }
+
         throw err;
       }
 
       const delay = resolveDelay(config, attempt);
 
-      // Track retry attempt for diagnostics
       retryHistory.push({
         attempt,
         delayMs: delay,
@@ -192,7 +202,7 @@ export async function runWithPromptRetry<T>(
       });
 
       log.info(
-        `[rate-limit] retry attempt ${attempt}/${attempts} after ${delay}ms, ` +
+        `[rate-limit] Retry attempt ${attempt}/${attempts} after ${delay}ms, ` +
           `reason: ${lastErrorMessage.slice(0, 100)}`,
       );
 
