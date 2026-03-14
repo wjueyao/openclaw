@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { callGateway } from "../../gateway/call.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import type { GatewayMessageChannel } from "../../utils/message-channel.js";
 import { AGENT_LANE_NESTED } from "../lanes.js";
 import { readLatestAssistantReply, runAgentStep } from "./agent-step.js";
@@ -92,6 +93,33 @@ export async function runSessionsSendA2AFlow(params: {
           break;
         }
         latestReply = replyText;
+
+        // Emit hook so channel plugins can forward A2A turns to users.
+        const hookRunner = getGlobalHookRunner();
+        if (hookRunner?.hasHooks("agent_to_agent_turn")) {
+          try {
+            await hookRunner.runAgentToAgentTurn(
+              {
+                turn,
+                maxTurns: params.maxPingPongTurns,
+                speakerSessionKey: currentSessionKey,
+                listenerSessionKey: nextSessionKey,
+                speakerRole: currentRole,
+                reply: replyText,
+                requesterChannel:
+                  typeof params.requesterChannel === "string" ? params.requesterChannel : undefined,
+                targetChannel,
+              },
+              {
+                requesterSessionKey: params.requesterSessionKey,
+                targetSessionKey: params.targetSessionKey,
+              },
+            );
+          } catch {
+            // Hook failures must not interrupt the A2A exchange.
+          }
+        }
+
         incomingMessage = replyText;
         const swap = currentSessionKey;
         currentSessionKey = nextSessionKey;
